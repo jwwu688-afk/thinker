@@ -142,6 +142,38 @@ def _classify_transient(exc):
 
 
 # =============================================================================
+# 【2026-11-17】工具参数"不可用"的两种形态，统一成一个判定
+#
+#   形态一：arguments 不是合法 JSON —— json.loads 直接抛 JSONDecodeError。
+#   形态二：arguments 是合法 JSON，但不是对象（`[]` / `123` / `"abc"`）。
+#          这种更隐蔽：解析这一步是"成功"的，问题要到 classify() 里
+#          第一句 `args.get(...)` 才爆出来，而那里已经离"写历史"很远了。
+#
+#   为什么要一个专门的类，而不是复用 ValueError：
+#     下面 _collect_parallel_batch 和 _handle_tool_calls 都靠 isinstance 分流，
+#     用 ValueError 会把"别处抛的 ValueError"（比如某个工具内部抛的）也误认成
+#     参数错误。——虽然目前的调用链里不会传进来，但判定条件写宽了，
+#     以后加一条路径就会踩到，而这种错法表现为"工具静默不执行"。
+#
+#   为什么不干脆抛异常、让主循环报错：
+#     那样历史里会留下"有 tool_calls、没有 tool 回复"的残缺序列，接口会 400，
+#     会话永久卡住（见 _handle_tool_calls 里的说明）。参数错误是模型能自己改的，
+#     正确做法是把失败原因作为 tool 结果塞回去。
+# =============================================================================
+class _InvalidToolArgs(Exception):
+    """工具参数不可用（能解析但不是 JSON 对象）"""
+
+
+def _is_arg_error(value) -> bool:
+    """这个解析结果是不是"参数不可用"
+
+    参数 value：parsed_args 里的一项，正常是 dict，异常情况是上面两种异常之一。
+    返回：True 表示调用方应该走"造一条工具失败结果"的分支，不要去碰 args。
+    """
+    return isinstance(value, (json.JSONDecodeError, _InvalidToolArgs))
+
+
+# =============================================================================
 # 【2026-11-08 第 14.2 轮】把 SDK 的 tool_calls 对象转成普通字典
 #
 # 【为什么必须转，两个原因一个比一个硬】
@@ -1159,7 +1191,18 @@ class Conversation:
             try:  # 再试：退一步，用"非流式"方式重发一次（不要逐字效果了，能拿到结果就行）
                 if not transient:  # 网络类在上面已经把"自动重试"说过了，别重复同一句话
                     self._ui_manager.print_info("正在改用非流式模式重试……")
-                response_message, token_usage = self._api_client.get_completion(request)  # 一次性拿完整结果
+                # 【2026-11-17 补】用 to_thread 跑：get_completion 是同步阻塞调用。
+                #   【原来为什么是问题】这条路径专门用来救"上游断流"，也就是本项目最高频的
+                #   故障。直接在协程里同步调用，会把整个事件循环冻住——等多久取决于模型：
+                #   SDK 默认超时 600 秒，一次慢响应就能让界面静止好几分钟。
+                #   期间 Esc 标志虽然被后台线程置上了，但检查点（iter_stream_with_esc）
+                #   根本没在跑；hook 子进程、MCP 的后台任务同样全停。用户体感是
+                #   "提示自动重试之后卡死"，比直接报错更难受。
+                #   【为什么这个写法是对的】同一个文件的 _summarize_messages（见下面
+                #   run_in_executor 那段注释）早就为同一个原因这么做了，这里照同一口径。
+                response_message, token_usage = await asyncio.to_thread(
+                    self._api_client.get_completion, request
+                )  # 一次性拿完整结果（在线程里等，不占事件循环）
                 self._ui_manager.print_assistant_message(response_message.content)  # 把内容显示出来
 
                 # Update token usage in history manager
@@ -1266,6 +1309,25 @@ class Conversation:
         """
         if self._session is None:
             return  # 没有会话文件（测试环境 / 还没建会话），跳过
+
+        # 【2026-11-17 补】子 agent 绝不能写压缩记录（原来漏了这个判断，会写坏主会话）
+        #
+        #   为什么不只是"没必要"，而是"必须拦住"：
+        #     子 agent 走 start_task() → start_new_chat()，换的是**内存里那一页**历史，
+        #     但 self._session 仍然指向主会话文件（第 404/418 行也明确"子 agent 不落盘"）。
+        #     而 keep_count 是那个子 agent 页保留的条数（比如 10），
+        #     total 却是主文件的条数（比如 200）——
+        #     于是这里算出 keep_from = 190 并写进主文件。
+        #
+        #     下次 /resume 由 session.py 的 _apply_compaction 执行 messages[190:]，
+        #     主对话的 200 条历史瞬间只剩 10 条，而且**全程不报错**；
+        #     "最后一条压缩记录生效"的取法还会让这条坏记录一直盖住合法记录，
+        #     直到主 agent 自己再压一次。用户看到的是"我接着上次聊，它全忘了"。
+        #
+        #   边界：子 agent 本来就不落盘，压缩结果自然也不需要持久化 ——
+        #   直接返回，和 add_message 里 is_subagent 的处理保持一致。
+        if self.is_subagent:
+            return
 
         total = self._session.count_messages()
         keep_from = max(0, total - int(keep_count))
@@ -1456,14 +1518,31 @@ class Conversation:
           安全边界没变松：classify() 的 plan 分支仍然会 deny 写工具与写命令，
           只是"看不到"变成了"看得见、动不了"，模型知道该往哪个方向写方案。
         """
-        exclude = {"task", "skill"} if self.is_subagent else None  # 子 agent：派活和加载技能都不给
+        # 【2026-11-17 补】排除名单加上 todo_write。
+        #   原来只排了 {"task", "skill"}，而上面第 1474-1476 行的注释已经写明风险：
+        #   "子 agent 拿到技能里的指令会去撞 todo_write，而那个工具的状态存在单例实例上，
+        #    一撞就覆盖主 agent 的待办清单"。也就是说作者当时认出了这个坑，
+        #    却只堵了"技能教它去撞"这条来路，没堵工具本身。
+        #   实测来路不止技能：主 agent 派活时完全可以把 todo_write 写进任务描述
+        #   （"先列个清单再干"是它自己的习惯），子 agent 照做就整体替换 self.todos。
+        #   后果：主 agent 下一轮读到的 todo 提醒（_run_one_iteration 末尾注入）
+        #   变成了子任务的清单，它会照着别人的计划往下做；屏幕上的清单同样被换掉，
+        #   而且没有任何提示说明这件事发生过。
+        #   子 agent 的生命周期本来就短（干完就交差），不需要跨轮提醒的清单；
+        #   真要给它进度能力，得把 todos 按历史页分开存，那是另一件事。
+        exclude = (
+            {"task", "skill", "todo_write"} if self.is_subagent else None
+        )  # 子 agent：派活、加载技能、写待办都不给
         allow = None  # None = 不限制（主 agent、或"继承全部"的子 agent）
         agent = self.current_agent
         if agent is not None and agent.tools is not None:
             # 白名单里再剔一次 task：万一用户在自己写的 md 里塞了 task（加载时已经告警并剔除），
             # 或者以后有人手工 register 时绕过了解析，这里仍然兜住。
             # 【第 21 轮】skill 同理：白名单里写了也不给，和 exclude 那条保持一致。
-            allow = {name for name in agent.tools if name not in ("task", "skill")}
+            # 【2026-11-17】todo_write 同理：exclude 挡的是"默认全给"的子 agent，
+            #   而写过 .thinker/agents/*.md 的子 agent 走的是 allow 白名单，
+            #   只在 exclude 里加会漏掉这一类。两处都剔，才和上面 skill 的口径一致。
+            allow = {name for name in agent.tools if name not in ("task", "skill", "todo_write")}
 
         # 【第 33.5 轮】这里不再按模式剪枝——见方法文档里那段撤掉清单层的说明。
         return await self._tool_manager.get_tools_description(exclude=exclude, allow=allow)  # 向工具管理器要清单
@@ -1530,12 +1609,35 @@ class Conversation:
         # 先把参数统一解析一遍，供"收集批次"和"单条执行"两条路复用。
         # 为什么不在各自的分支里临时解析：批次收集需要**提前**看后面几条能不能并，
         # 到那时候再解析就是同一份 JSON 解两次。
+        #
+        # 【2026-11-17 补】"合法 JSON 但不是对象"也要当成参数错误。
+        #   json.loads 只挡语法错误：`"[]"`、`"123"`、`"\"abc\""` 都能解析成功，
+        #   但模型给出的工具参数必须是对象（后面每个工具都按 dict 取 key）。
+        #   改前这些值会直接流到 classify()，第一句 `args.get("need_user_approve")`
+        #   就 AttributeError —— 而这个异常没有人接（本方法外面只有主循环那一层 try），
+        #   结果是：assistant 的 tool_calls 已经写进历史（见上面的 add_message），
+        #   一条 tool 回复都没写回，整个会话到此为止；再 --continue 也会因为
+        #   "tool_calls 后面必须跟 tool 消息"被接口 400 拒掉，且会话文件是 append-only，
+        #   修不好，只能 /clear 丢掉上下文。
+        #   用一个专门的异常类型表示"参数不可用"，让它走上和 JSONDecodeError 完全相同的
+        #   兜底路径（造一条工具失败结果塞回历史，让模型下一轮自己改对）。
         parsed_args = []
         for call in tool_calls:
             try:
-                parsed_args.append(json.loads(call.function.arguments))
+                value = json.loads(call.function.arguments)
             except json.JSONDecodeError as e:
                 parsed_args.append(e)  # 解析失败的异常先存着，轮到它时再报错
+                continue
+            if not isinstance(value, dict):
+                # 内存里只放异常对象，不放原值：后面两条路径都只认"是不是错误"，
+                # 原值塞进消息里还可能把一大段内容写进日志。
+                parsed_args.append(
+                    _InvalidToolArgs(
+                        f"工具参数必须是 JSON 对象，实际是 {type(value).__name__}"
+                    )
+                )
+                continue
+            parsed_args.append(value)
 
         index = 0
         while index < total:
@@ -1543,16 +1645,22 @@ class Conversation:
             parsed = parsed_args[index]
             is_last_tool = (index == total - 1)  # 整轮最后一条要挂 todo 提醒
 
-            if isinstance(parsed, json.JSONDecodeError):
+            if _is_arg_error(parsed):
                 # 模型把参数写成了非法 JSON。这里不抛异常，而是造一条"失败结果"塞回历史，
                 # 让它下一轮自己改对（和工具执行失败的处理一致）。
                 self._ui_manager.print_error(f"Tool parameter parsing failed: {parsed}")
+                # 【2026-11-17】文案带上具体原因：现在这条分支同时服务"JSON 语法错"
+                #   和"能解析但不是对象"两种情形，一句固定的"不是合法 JSON"
+                #   会把后者的现象描述反了（它明明是合法 JSON），模型照着这句话
+                #   修语法反而越修越偏。把异常原文拼进去，它一眼就知道该改成对象。
                 self.add_message({
                     "role": "tool",
                     "tool_call_id": tool_call.id,  # 必须对上号，否则接口会拒
                     "name": tool_call.function.name,
                     "content": [
-                        {"type": "text", "text": "工具调用失败：参数不是合法的 JSON，请检查 tool 的 arguments 格式后重试。"}
+                        {"type": "text", "text": f"工具调用失败：{parsed}。"
+                                                  "tool 的 arguments 必须是一个合法的 JSON 对象，"
+                                                  "请按参数说明重新生成后重试。"}
                     ],
                 })
                 index += 1
@@ -1701,7 +1809,10 @@ class Conversation:
 
         while index < total:
             parsed = parsed_args[index]
-            if isinstance(parsed, json.JSONDecodeError):  # 留给单条路径单独报错
+            if _is_arg_error(parsed):  # 留给单条路径单独报错
+                # 【2026-11-17】判定从 isinstance(…, JSONDecodeError) 改成 _is_arg_error()：
+                #   除了语法错误，还要让"合法 JSON 但不是对象"也在这里断开批次，
+                #   否则它会被塞进并发批，在 _execute_tools_parallel 里取 .items() 时炸掉。
                 break
             name = tool_calls[index].function.name
             # 【第 33 轮】带上当前模式：plan 模式下只读工具仍是 allow，
@@ -1838,6 +1949,15 @@ class Conversation:
             # 【第 21 轮】子 agent 也不能加载技能。清单层已经不给它看了（_get_available_tools），
             # 但模型可能凭上一轮的工具清单、或者凭训练里的习惯直接写出工具名，
             # 所以执行层再拦一次。拒绝理由要写清"自己去干"，否则模型会绕着试。
+            return False
+        if tool_name == "todo_write":
+            # 【2026-11-17 补】子 agent 不能写待办清单。理由和 skill 那层不同：
+            #   skill 是「不该看」，todo_write 是「一写就破坏主 agent 的状态」。
+            #   TodoWrite 是单例实例（ToolManager 只 register 一次），todos 存在实例属性上，
+            #   子 agent 与主 agent 共用同一个对象；子 agent 调一次就是整体替换，
+            #   主 agent 的清单被静默覆盖，之后每轮注入的 todo 提醒都指向子任务。
+            #   清单层（_get_available_tools 的 exclude / allow）已经把它拿掉了，
+            #   这里兜的是「模型凭上一轮记忆直接写出工具名」那条路。
             return False
         if agent.tools is None:
             return True  # 继承全部（除 task）

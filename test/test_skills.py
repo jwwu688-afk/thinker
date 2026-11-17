@@ -779,11 +779,20 @@ def test_subagent_gates():
 
     check("执行层：子 agent 拿不到 skill", conversation._is_tool_allowed("skill") is False)
     check("执行层：子 agent 也拿不到 task", conversation._is_tool_allowed("task") is False)
+    # 【2026-11-17 新增】todo_write 也被执行层拦住。
+    #   它不是"不该看"，而是"一写就破坏主 agent 的状态"：TodoWrite 是单例实例，
+    #   todos 存在实例属性上，子 agent 调一次就整体替换主 agent 的清单。
+    check("执行层：子 agent 也拿不到 todo_write",
+          conversation._is_tool_allowed("todo_write") is False)
     check("执行层：白名单里的工具照常可用", conversation._is_tool_allowed("file_read") is True)
 
     asyncio.run(conversation._get_available_tools())
     exclude = conversation._tool_manager.seen[-1][0]
-    check("清单层：exclude 里同时有 task 和 skill", exclude == {"task", "skill"}, str(exclude))
+    # 【2026-11-17】期望集合加上 todo_write：它和 task / skill 一样不该下发给子 agent。
+    #   这条断言原来写死 {"task", "skill"}，正是"改了一处、漏了另一处"的原因——
+    #   集合变了必须让测试红一次，否则静默漂移。
+    check("清单层：exclude 里同时有 task、skill 和 todo_write",
+          exclude == {"task", "skill", "todo_write"}, str(exclude))
 
     # 主 agent（深度 0、没有 agent 定义）不该受限制
     conversation._task_depth = 0

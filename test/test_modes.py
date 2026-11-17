@@ -205,6 +205,16 @@ check("plan 下 node --check 可以跑",
       classify("cmd_runner", {"command": "node --check a.js"}, MODE_PLAN).action == ACTION_ALLOW)
 check("plan 下 npm install 被拒绝",
       classify("cmd_runner", {"command": "npm install"}, MODE_PLAN).action == ACTION_DENY)
+# 【2026-11-17 新增】单个 `&` 也是命令串联符（cmd.exe 的标准写法，不是 `&&` 才算）。
+#   改前 _WRITE_MARKERS 只认 `>` / `$(` / 反引号 / 换行，于是下面这条在计划模式下
+#   被判成"只读"，写操作能藏在只读命令后面执行 —— 计划模式的核心承诺是"不动手"，
+#   这条必须堵住。用无空格写法一起测：cmd 允许 `dir&copy a b` 紧贴着写。
+check("plan 下 `dir & copy` 被拒绝（单 & 也是串联符）",
+      classify("cmd_runner", {"command": "dir & copy a.txt b.txt"}, MODE_PLAN).action == ACTION_DENY)
+check("plan 下 `dir&copy`（无空格）同样被拒绝",
+      classify("cmd_runner", {"command": "dir&copy a.txt b.txt"}, MODE_PLAN).action == ACTION_DENY)
+check("plan 下普通的只读命令不受影响",
+      classify("cmd_runner", {"command": "git status"}, MODE_PLAN).action == ACTION_ALLOW)
 
 # ---------------------------------------------------------------------------
 # 6) 给模型的说明
