@@ -177,5 +177,81 @@ if os.name == "nt" and shutil.which("npx"):
     resolved = resolve_command("npx")
     check("npx 解析成带扩展名的真实文件", resolved.lower().endswith(".cmd") and pathlib.Path(resolved).exists(), resolved)
 
+print("\n[7] MCP 工具边连边注册（2026-11-18）")
+# 这一条锁的是本轮改动：注册任务原来是 `await get_connected()`（等全部连完），
+# 于是"给等待设了上限"之后，超时降级的那一刻拿到的是空表 —— 实测第一轮 0 个 MCP 工具，
+# 而那时 weather / calculator / github 早就连好了。
+# 现在改成轮询：连上一个就登记一个。这里用假客户端模拟"先连上一个、之后才全部就绪"。
+import tools.tool_manager as tm_mod  # noqa: E402
+
+
+class FakeSession:
+    """假的 MCP 会话：只需要 list_tools()"""
+
+    def __init__(self, tool_names):
+        self._tool_names = tool_names
+
+    async def list_tools(self):
+        return SimpleNamespace(
+            tools=[SimpleNamespace(name=n, description="", inputSchema={}) for n in self._tool_names]
+        )
+
+
+class FakeMCP:
+    """假客户端：connections 可以在测试过程中往里加，模拟"边连边出现" """
+
+    def __init__(self):
+        self.connections = {}
+        self.ready = False
+        self.is_closing = False
+        self.tool_names = {}
+        self.tool_errors = {}
+
+    @property
+    def is_ready(self):
+        return self.ready
+
+    def note_tools(self, name, names):
+        self.tool_names[name] = list(names)
+
+    def note_tool_error(self, name, reason):
+        self.tool_errors[name] = reason
+
+
+class FakeMcpTool:
+    """替身工具：真的 McpTool 要包协议细节，这里只关心"有没有被登记" """
+
+    def __init__(self, tool, session):
+        self.name = tool.name
+
+    def json_schema(self):
+        return {"type": "function", "function": {"name": self.name}}
+
+
+_original_mcp_tool = tm_mod.McpTool
+tm_mod.McpTool = FakeMcpTool
+try:
+    manager = object.__new__(tm_mod.ToolManager)  # 绕开单例的 __new__（那会去连真服务器）
+    manager.tools = {}
+    fake_client = FakeMCP()
+    fake_client.connections["fast"] = FakeSession(["t1", "t2"])  # 一开始只连上一个
+    manager._mcp_client = fake_client
+
+    async def _run_registration():
+        task = asyncio.create_task(tm_mod.ToolManager._register_mcp_tool(manager))
+        await asyncio.sleep(0.3)  # 比轮询间隔 0.2s 略长，够跑一轮
+        mid = set(manager.tools)  # 此刻还没全部就绪
+        fake_client.connections["slow"] = FakeSession(["t3"])  # 后面那个连上了
+        fake_client.ready = True
+        await task
+        return mid, set(manager.tools)
+
+    mid_tools, final_tools = asyncio.run(_run_registration())
+    check("未全部就绪时，已连上的服务器先登记", mid_tools == {"t1", "t2"}, mid_tools)
+    check("全部就绪后补齐剩下的", final_tools == {"t1", "t2", "t3"}, final_tools)
+    check("工具名按服务器记回客户端", fake_client.tool_names.get("fast") == ["t1", "t2"], fake_client.tool_names)
+finally:
+    tm_mod.McpTool = _original_mcp_tool  # 一定要还原，别把替身泄漏给后面的用例
+
 print(f"\n通过 {passed} 项，失败 {failed} 项\n")
 sys.exit(1 if failed else 0)

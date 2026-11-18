@@ -119,59 +119,26 @@ class SmartContextCropper(BaseTool):
         return ""  # 没有状态要汇报
 
     def _tool_description(self):
-        # 【2026-11-06 第 3 轮】整段翻译成中文，两个示例也换成了中文。
+        # 【2026-11-06 第 3 轮】整段翻译成中文。
+        # 【2026-11-18 精简】从 1096 token 压到约 320：删掉两个完整对话示例
+        #   （各含一大段 <smart_context_cropper> 调用和 reasoning），
+        #   换成一句参数示例。规则本身一条没少——保留最新一条用户消息、
+        #   top/bottom 的语义、什么情况下要问用户、删之前先把结论留进摘要。
         return """
 从聊天记录的开头或结尾裁剪消息，同时保证"用户最新说的那句"永远不会被删掉。
+只在上下文快满、或用户明确要求清理时才用；平时有自动压缩，不需要主动调用。
 
-执行 smart_context_cropper 之前，请遵循以下规则：
+裁剪规则：
+- 永远保留最新一条用户消息。
+- crop_direction="top" 删掉系统提示词之后最老的那些消息；"bottom" 删最近的。
+- 判断"被删内容与当前任务无关"才可以直接删（need_user_approve=false）；
+  只要有一点不确定，就设 need_user_approve=true 先问一次。
 
-1. 裁剪规则
-    - 永远保留最新一条用户消息。
-    - 从顶部裁剪 → 删掉系统提示词之后最老的那些消息。
-    - 从底部裁剪 → 优先删最近的那些消息。
+被删内容里有有用信息时，先用一句话把结论写进 deleted_messages_summary 再删；
+确实没有有用信息就留空。
 
-2. 是否需要用户同意
-    - 始终结合用户当前的任务来判断。
-    - 如果你确定要删的内容与当前任务无关，可以不问直接删。
-    - 只要有一点不确定，就先征求用户确认。
-
-3. 如何处理被删内容
-    - 如果被删的消息里有有用信息，删除前先用一句话把结论留下来。
-    - 摘要要保留可能仍然与用户当前任务相关的上下文。
-    - 如果被删内容确实没有任何有用信息，deleted_messages_summary 可以留空。
-
-<example>
-系统提示词：你是一个专业的编程助手。
-用户消息：写一个计算斐波那契数列的 Python 函数。
-助手：这是基础版本……
-用户消息：请优化一下性能。
-助手：这是优化后的版本……
-</example>
-<smart_context_cropper>
-smart_context_cropper(
-    need_user_approve = true,
-    crop_direction = "top",
-    crop_amount = 2,
-)
-</smart_context_cropper>
-
-<example>
-系统提示词：你是一个专业的排障助手。
-用户消息：诊断一下我们 API 每天午夜出现的延迟尖峰。
-助手：我先验证几个假设……
-助手：尝试 1：开启详细日志后观察到长时间的 GC 停顿；调整了 GC 参数，但延迟没有下降。
-助手：尝试 2：怀疑是数据库写锁；给热点表加了索引；没有明显改善。
-助手：尝试 3：排查是否与批处理任务相关；关掉了一个实验，但尖峰依然存在。
-# 把三次失败总结完之后，这些详细的尝试记录就可以从底部删掉，让上下文更聚焦。
-</example>
-<smart_context_cropper>
-smart_context_cropper(
-    need_user_approve = false,
-    crop_direction = "bottom",
-    crop_amount = 3,
-    deleted_messages_summary = "失败总结：(1) 调整 GC 参数无效，虽然确实观察到了长停顿；(2) 数据库写锁的假设不成立——加索引并没有降低延迟；(3) 批处理任务的相关性无法确认——关掉相关实验后没有变化。结论：尖峰很可能是因为定时任务和数据库维护时段重叠。下一步：检查 00:00 的定时任务和数据库清理/备份窗口，在那段时间加临时限流或排队。"
-)
-</smart_context_cropper>
-
-</examples>
-    """.strip()
+示例：pending 里堆了三次失败尝试的细节，用户只想看结论时
+  smart_context_cropper(crop_direction="bottom", crop_amount=3,
+    need_user_approve=false,
+    deleted_messages_summary="三组尝试都没解决：调 GC 参数无效、加索引无效、关实验无效。")
+""".strip()

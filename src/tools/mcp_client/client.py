@@ -30,13 +30,30 @@ from pathlib import Path  # 路径处理，用来判断配置文件在不在
 from mcp import ClientSession, StdioServerParameters, LoggingLevel  # MCP 官方库的几个核心类
 from mcp.client.stdio import stdio_client  # 专门负责"用标准输入输出方式连接"的函数
 
-from anthropic import Anthropic  # 导入了但没用到（残留代码，可以删）
 from dotenv import load_dotenv  # 读取 .env
 
 from .server_config import MCPConfig  # 导入配置读取器
 from tools.mcp_config import resolve_config_path  # 【2026-11-12】配置路径的唯一真源（与 `thinker mcp` 命令共用）
 
 load_dotenv()  # load environment variables from .env（把配置读进来）
+
+# 【2026-11-18】单个 MCP 服务器完成握手的最长时间（秒）。
+#
+# 为什么必须有：握手是"把子进程起来之后，等它回应协议版本和工具列表"。
+#   进程起来了却不回应的情况很常见——npx 正在下载依赖、脚本阻塞在 stdin、
+#   服务器读不到 token 文件后挂住。原来这里没有上限，一个服务器就能把整个
+#   _connect_all 拖住，排在后面的服务器永远轮不到。
+#
+# 为什么是 8 秒：给 npx 冷启动留余量（实测单个 2~5 秒），同时保证真卡住的那个
+#   不会把 5 个服务器的串行等待拖成分钟级。超时的服务器会被记成"连接失败"，
+#   /mcp 面板里能看到具体原因。
+MCP_SERVER_TIMEOUT = 8.0
+
+# 【2026-11-18 删除】这里原来有一行 `from anthropic import Anthropic`，
+#   注释自己写着"导入了但没用到（残留代码，可以删）"，实测确认整个仓库里
+#   没有任何地方引用这个类（其余出现全在注释文字里）。而 anthropic 是个不小的包，
+#   它被 mcp_client 拖进 import 链，等于每次启动都多付一份导入时间。
+#   删掉纯赚：不改变任何行为。
 
 
 def resolve_command(command: str) -> str:
@@ -231,7 +248,14 @@ class MCPClient:
                 # 在通道上建立一个"会话"，同样登记到资源栈
                 # ClientSession 是 MCP 协议的会话层，包装上面的读写通道，提供 initialize()、call_tool()、list_tools() 等方法
 
-                await session.initialize()  # 握手：双方交换版本和能力信息（必须做，不然对方不认你）
+                # 【2026-11-18】握手加超时。
+                #   原来这里是裸 await session.initialize()：只要某个服务器
+                #   把进程起来了却不回应握手（npx 正在下载依赖、脚本阻塞在 stdin、
+                #   权限弹窗没人点），这一句就永久挂住，后面的服务器一个都轮不到，
+                #   而 _ready 永远不会 set —— 表现是首轮请求前整个程序静止。
+                #   超时后走下面的 except，当作"这个服务器连接失败"，写进 /mcp 的失败原因里，
+                #   其余服务器照常继续（这正是这个 for 循环每轮独立 try 的本意）。
+                await asyncio.wait_for(session.initialize(), timeout=MCP_SERVER_TIMEOUT)
                 self.connections[name] = session  # 【第 31 轮】按名字存，/mcp 靠它判断"这个连上了"
             except Exception as e:  # 这个服务器连接失败
                 print(f"[MCP] 连接服务器 '{name}' 失败：{e}（已跳过，其他工具不受影响）")

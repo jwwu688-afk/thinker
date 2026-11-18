@@ -11,6 +11,7 @@
 # =============================================================================
 
 import asyncio  # 用来创建"后台任务"（连 MCP 服务器比较慢，不能卡住启动）
+import sys  # 【2026-11-18】超时提示走 stderr，不混进正常输出
 from tools.cmd_runner import CmdRunner  # 导入命令执行工具
 from tools.file_tools import FileRead, FileWrite, FileEdit, FileGlob, FileGrep  # 【第 8 轮】五个文件专用工具
 from tools.mcp_tool import McpTool  # 导入"MCP 工具包装器"（把外部工具包成我们能用的样子）
@@ -18,6 +19,27 @@ from tools.smart_context_cropper import SmartContextCropper  # 导入上下文�
 from tools.task import Task  # 导入子任务工具（让模型能派活）
 from tools.todo_write import TodoWrite  # 导入待办清单工具
 from .mcp_client.client import MCPClient  # 导入 MCP 客户端（负责连外部服务器）
+
+# 【2026-11-18】等 MCP 注册完成的最长时间（秒）。
+#
+# 为什么需要这个数：工具清单是**每一轮请求**都要用的，而清单里要包含 MCP 工具，
+#   就必须先等后台的"连服务器 + 取工具列表"跑完。原来这里是无限等待，
+#   实测本机 5 个服务器（3 个走 npx 冷启动）20 秒仍没连完，期间界面完全静止。
+#
+# 为什么是 6 秒：这是"用户还能忍"和"够多数服务器连上"的折中。
+#   · 走 python 直接起的服务器（weather / calculator）通常 1 秒内完成；
+#   · npx 冷启动要 2~5 秒，6 秒能让它们中快的那些赶上第一轮；
+#   · 超过 6 秒还没连完的，多半是网络慢或在下载依赖，继续等下去收益很低。
+#   超时不是失败：后台任务继续跑，MCP 工具在下一轮清单里出现。
+MCP_READY_TIMEOUT = 6.0
+
+# 【2026-11-18】边连边注册的轮询间隔（秒）。
+#
+# 为什么需要它：连接是串行的，每连上一个服务器就往 connections 里写一条。
+#   注册任务要"连上一个就登记一个"，只能定期回头看一眼当前连上了谁。
+#   0.2 秒是"够快"和"别空转"的折中：一个服务器的工具清单只要几十毫秒就能取回，
+#   晚 0.2 秒登记对用户没有可感知差别；而 10 秒的连接窗口里也只轮询 50 次。
+MCP_REGISTRATION_POLL_INTERVAL = 0.2
 
 
 class ToolManager:
@@ -78,36 +100,60 @@ class ToolManager:
         self.register_mcp_task = asyncio.create_task(self._register_mcp_tool())
 
     async def _register_mcp_tool(self):
-        # 这个方法是后台跑的：连上所有 MCP 服务器，把它们提供的工具都登记进来
-        # 【2026-11-12 第 31 轮】改用 get_connected()：它返回「名字 → 会话」的映射。
-        #   原来拿的是纯会话列表，循环里不知道当前这条是谁，于是：
-        #     · /mcp 想问"这个服务器提供了几个工具"，答不上来；
-        #     · 下面那句失败提示也没法说出服务器名字，多个服务器时看不出是哪个挂了。
-        connections = await self._mcp_client.get_connected()  # 等所有服务器连接完成，拿到映射
-        for name, session in connections.items():  # 一个个服务器
-            try:  # 【2026-11-06 优化】单个服务器"问工具清单"失败时不要连累其他服务器
-                #   比如某个服务器启动成功但 list_tools 报错，
-                #   原来会直接抛出异常，导致整个工具清单都拿不到。
-                response = await session.list_tools()  # 问它："你都有什么工具？"
-                tools = response.tools  # 拿到工具清单
-                # 【第 31 轮】先记回客户端，/mcp 才能显示"几个工具"
-                self._mcp_client.note_tools(name, [tool.name for tool in tools])
-                for tool in tools:  # 遍历每一个工具
-                    mcp_tool = McpTool(tool, session)  # 包装成我们内部能用的工具对象
-                    self._register_tool(tool.name, mcp_tool)  # 用工具原名登记
-            except Exception as e:  # 这个服务器出问题了
-                # 【2026-11-07 第 13.1 轮】退出瞬间的失败不是失败。
-                #   程序收尾时后台任务被取消，没跑完的 list_tools 会抛一个 str 为空的异常，
-                #   原来会打印成"[MCP] 获取工具列表失败：（已跳过该服务器）"——
-                #   冒号后面什么都没有，看起来像故障，实际只是正在退出。
-                #   真正的失败也补上异常类型：原来只有 {e}，遇到空消息就完全没线索。
-                if self._mcp_client.is_closing:
-                    return
-                # 【第 31 轮】同样把原因记回客户端：这条服务器"连上了但没工具"，
-                #   /mcp 里要能和"连不上"区分开（两者排查方向完全不同）。
-                reason = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
-                self._mcp_client.note_tool_error(name, reason)
-                print(f"[MCP] 获取工具列表失败：{reason}（服务器 {name}，已跳过）")
+        # 这个方法是后台跑的：连上 MCP 服务器，把它们提供的工具都登记进来
+        # 【2026-11-12 第 31 轮】用「名字 → 会话」的映射（不是纯会话列表），
+        #   否则 /mcp 答不上"这个服务器提供了几个工具"，失败提示也说不出是哪个服务器。
+        #
+        # 【2026-11-18 改成边连边注册】原来第一句是 `await self._mcp_client.get_connected()`，
+        #   而那个方法内部是 `await self._ready.wait()` —— 要等**全部**服务器连完才返回。
+        #   两个后果：
+        #     1. 只要有一个服务器慢，已经连好的那些也一个都登记不进去；
+        #     2. get_tools_description() 里给等待设了上限（MCP_READY_TIMEOUT），
+        #        超时降级时读到的是一张空表，所以第一轮请求一个 MCP 工具都看不到。
+        #        实测就是这样：6 秒超时、拿到 0 个 MCP 工具，而实际上那时
+        #        weather(1.6s) / calculator(1.5s) / github(1.8s) 早就连好了。
+        #
+        #   现在改成轮询：每 0.2 秒看一眼"当前连上了谁"，连上一个就立刻登记它的工具，
+        #   直到 is_ready 为真（连接阶段整体结束）才退出。
+        #   这样超时降级的那一刻，先连上的服务器是可用的，只有慢的那个缺席。
+        #
+        #   为什么用轮询而不是回调/事件：连接逻辑在 MCPClient 里，是"串行 for 循环"，
+        #   每连一个就往 connections 里写一条。加回调要改那边的结构；
+        #   而这里 0.2 秒一次的字典拷贝，在 10 秒的连接窗口里只有 50 次，代价可以忽略。
+        registered = set()  # 已经处理过的服务器名（失败的不重试，避免每 0.2 秒刷一次屏）
+        while True:
+            for name, session in list(self._mcp_client.connections.items()):
+                if name in registered:  # 这个服务器已经登记过了
+                    continue
+                registered.add(name)  # 先标记：无论下面成功失败，都不再重复处理
+                try:
+                    response = await session.list_tools()  # 问它："你都有什么工具？"
+                    tools = response.tools  # 拿到工具清单
+                    # 【第 31 轮】记回客户端，/mcp 才能显示"几个工具"
+                    self._mcp_client.note_tools(name, [tool.name for tool in tools])
+                    for tool in tools:  # 遍历每一个工具
+                        mcp_tool = McpTool(tool, session)  # 包装成我们内部能用的工具对象
+                        self._register_tool(tool.name, mcp_tool)  # 用工具原名登记
+                except Exception as e:  # 这个服务器出问题了
+                    # 【2026-11-07 第 13.1 轮】退出瞬间的失败不是失败。
+                    #   程序收尾时后台任务被取消，没跑完的 list_tools 会抛一个 str 为空的异常，
+                    #   原来会打印成"[MCP] 获取工具列表失败：（已跳过该服务器）"——
+                    #   冒号后面什么都没有，看起来像故障，实际只是正在退出。
+                    #   真正的失败也补上异常类型：原来只有 {e}，遇到空消息就完全没线索。
+                    if self._mcp_client.is_closing:
+                        return
+                    # 【第 31 轮】同样把原因记回客户端：这条服务器"连上了但没工具"，
+                    #   /mcp 里要能和"连不上"区分开（两者排查方向完全不同）。
+                    reason = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+                    self._mcp_client.note_tool_error(name, reason)
+                    print(f"[MCP] 获取工具列表失败：{reason}（服务器 {name}，已跳过）")
+
+            # 连接阶段整体结束了就收工。注意这个判断必须放在遍历**之后**：
+            # is_ready 是在 _connect_all 返回后才点亮的，点亮时 connections 已经完整，
+            # 先遍历再判断，最后一个服务器就不会被漏掉。
+            if self._mcp_client.is_ready:
+                return
+            await asyncio.sleep(MCP_REGISTRATION_POLL_INTERVAL)
 
     def _register_tool(self, name, tool_instance):
         self.tools[name] = tool_instance  # 就是往字典里塞一条
@@ -171,7 +217,35 @@ class ToolManager:
         """
         self._ensure_mcp_registration()  # 【2026-11-06 第 2 轮新增】确保后台注册任务已启动
         if self.register_mcp_task is not None:  # 启动了才需要等
-            await self.register_mcp_task  # 先等后台那个"注册 MCP 工具"的任务干完
+            # 【2026-11-18】原来这里是裸 `await self.register_mcp_task`，没有任何上限。
+            #   实测：本机配了 5 个服务器（github / 12306 / duckduckgo 三个走 npx），
+            #   连测两次都是 20 秒以上还没连完，而这段时间屏幕完全静止——
+            #   spinner 要等到第一次请求发出去、拿到首字节才启动，所以用户看到的是
+            #   "敲完第一句话回车之后，程序不动了"。
+            #
+            #   现在给它一个等待上限：超时就先用已有的内置工具开工，后台连接继续跑；
+            #   下一轮请求要清单时，连上的 MCP 工具自然会出现。
+            #   代价是"第一轮看不到 MCP 工具"，比"卡住不动"好得多。
+            #
+            #   【为什么必须 shield】
+            #     wait_for 超时会 **取消** 被等的那个任务。register_mcp_task 一旦被取消，
+            #     MCP 就永远连不上了（后续每轮都会拿到空清单，而且没有任何报错）。
+            #     shield 让超时只放弃"等待"这一动作，任务本身继续跑。
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self.register_mcp_task), timeout=MCP_READY_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                # 走 stderr：这是运行状态提示，不该混进正常输出流（会被当成回答的一部分）
+                print(
+                    f"[MCP] 服务器仍在连接（>{MCP_READY_TIMEOUT:g}s），本轮先用内置工具；"
+                    f"连上后下一轮自动可用。",
+                    file=sys.stderr,
+                )
+            except Exception as error:
+                # 任务本身炸了（连接阶段的兜底异常）：不能让它冒出去，
+                # 否则整轮请求会因为"某个外部服务器坏了"而失败。
+                print(f"[MCP] 注册任务异常（已忽略）：{type(error).__name__}: {error}", file=sys.stderr)
         exclude = exclude or set()  # 如果传了 None，就换成空集合（方便后面判断"在不在里面"）
         allow = None if allow is None else set(allow)  # None 保持 None，表示"不限制"
         descriptions = []  # 准备结果列表
